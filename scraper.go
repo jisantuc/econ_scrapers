@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -44,13 +45,6 @@ func write_urls(outf string, uds []UrlDirector) {
 	f.Write(jsonified)
 }
 
-//TODO: write scraper functions for each journal page
-//JPE: http://econpapers.repec.org/article/ucpjpolec/doi_3a10.1086_2f684718.htm
-//EMA: http://econpapers.repec.org/article/wlyemetrp/v_3a83_3ay_3a2015_3ai_3a5_3ap_3a1685-1725.htm
-//AER: http://econpapers.repec.org/article/aeaaecrev/v_3a106_3ay_3a2016_3ai_3a4_3ap_3a855-902.htm
-//ReStud1: http://econpapers.repec.org/article/ouprestud/v_3a82_3ay_3a2015_3ai_3a3_3ap_3a825-867..htm
-//ReStud2: http://restud.oxfordjournals.org/content/82/3/825
-
 func getCitation(sel *goquery.Selection) string {
 	strSlice := make([]string, 2)
 	strSlice[0] = sel.Find("h1").Text()             // title
@@ -59,7 +53,55 @@ func getCitation(sel *goquery.Selection) string {
 }
 
 func ProcAERUrl(url string) Record {
-	return Record{}
+	doc, err := goquery.NewDocument(url)
+	if err != nil {
+		fmt.Println(url)
+		log.Fatal(err)
+	}
+
+	var rec Record
+
+	jelFromHref := func(i int, s *goquery.Selection) {
+		href, _ := s.Attr("href")
+		if strings.Index("jel", href) != -1 {
+			length := len([]rune(href))
+			code := href[length-3:]
+			rec.JelCodes = append(rec.JelCodes, code)
+		}
+	}
+
+	bodyText := doc.Find("div.bodytext")
+	abstractRaw := bodyText.Find("p:nth-child(6)").Text()
+	// apparently some AER papers **don't have abstracts**?? what the hell
+	if strings.Index(abstractRaw, "Abstract") == -1 {
+		return rec
+	}
+	abstractRawLength := len([]rune(abstractRaw))
+	var firstJel int
+	jelInd := strings.Index(abstractRaw, " (JEL")
+	if jelInd >= 0 {
+		firstJel = jelInd + len([]rune(" (JEL "))
+		rec.Abstract = abstractRaw[:jelInd]
+		codes := abstractRaw[firstJel : abstractRawLength-1]
+		if strings.Index(", ", codes) >= 0 {
+			codesSl := strings.Split(codes, ", ")
+			for _, code := range codesSl {
+				rec.JelCodes = append(rec.JelCodes, code)
+			}
+		} else {
+			rec.JelCodes = append(rec.JelCodes, codes)
+		}
+	} else {
+		rec.Abstract = abstractRaw
+		codeBlock := bodyText.Find("p:nth-child(7) a")
+		codeBlock.Each(jelFromHref)
+	}
+
+	rec.Citation = getCitation(bodyText)
+	rec.Url = url
+	rec.Journal = "AER"
+
+	return rec
 }
 
 func ProcQJEUrl(url string) Record {
@@ -106,15 +148,74 @@ func ProcQJEUrl(url string) Record {
 }
 
 func ProcJPEUrl(url string) Record {
-	return Record{}
+	doc, err := goquery.NewDocument(url)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var rec Record
+
+	bodyText := doc.Find("div.bodytext")
+	abstractRaw := bodyText.Find("p:nth-child(6)").Text()
+	rec.Abstract = abstractRaw
+	rec.Citation = getCitation(bodyText)
+	rec.Url = url
+	rec.Journal = "JPE"
+
+	return rec
 }
 
 func ProcEMAUrl(url string) Record {
-	return Record{}
+	doc, err := goquery.NewDocument(url)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var rec Record
+
+	bodyText := doc.Find("div.bodytext")
+	abstractRaw := bodyText.Find("p:nth-child(6)").Text()
+	rec.Abstract = abstractRaw
+	rec.Citation = getCitation(bodyText)
+	rec.Url = url
+	rec.Journal = "EMA"
+
+	return rec
 }
 
 func ProcRESUrl(url string) Record {
-	return Record{}
+	doc, err := goquery.NewDocument(url)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var rec Record
+
+	bodyText := doc.Find("div.bodytext")
+	abstractRaw := bodyText.Find("p:nth-child(6)").Text()
+	rec.Abstract = abstractRaw
+	rec.Citation = getCitation(bodyText)
+	rec.Url = url
+	rec.Journal = "RES"
+
+	// special handling necessary because JEL codes are hidden behind the
+	// link to the text of the paper
+	paperLink := bodyText.Find("p:nth-child(8) a").Text()
+	linkDoc, err := goquery.NewDocument(paperLink)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	elements := linkDoc.Find("ul.jel li span a")
+
+	f := func(i int, s *goquery.Selection) {
+		rec.JelCodes = append(rec.JelCodes, s.Text())
+	}
+
+	elements = elements.Each(f)
+
+	return rec
+
 }
 
 func getFunc(journal string) func(string) Record {
@@ -155,24 +256,102 @@ func scrape_links(url, journal string) []UrlDirector {
 	return outSlice
 }
 
-func ScrapeQJE(ch chan Record) {
+func write_out(f *os.File, rec Record) {
+
+	js, jserr := json.Marshal(rec)
+	if jserr != nil {
+		log.Fatal(jserr)
+	}
+	f.Write(js)
+	f.Write([]byte("\n"))
+
+}
+
+func ScrapeQJE(f *os.File, wg *sync.WaitGroup) {
 	journal := "QJE"
 	url := "http://econpapers.repec.org/article/oupqjecon/"
 	links := scrape_links(url, journal)
 	var fullUrl string
 	for _, lnk := range links {
 		fullUrl = url + lnk.Url
-		ch <- ProcURL(fullUrl, lnk.Journal)
+		rec := ProcURL(fullUrl, lnk.Journal)
+		write_out(f, rec)
 	}
-	close(ch)
+	wg.Done()
 }
 
-// TODO write scrape functions for other journals
+func ScrapeJPE(f *os.File, wg *sync.WaitGroup) {
+	journal := "JPE"
+	url := "http://econpapers.repec.org/article/ucpjpolec/"
+	links := scrape_links(url, journal)
+	var fullUrl string
+	for _, lnk := range links {
+		fullUrl = url + lnk.Url
+		rec := ProcURL(fullUrl, lnk.Journal)
+		write_out(f, rec)
+	}
+	wg.Done()
+}
+
+func ScrapeEMA(f *os.File, wg *sync.WaitGroup) {
+	journal := "EMA"
+	url := "http://econpapers.repec.org/article/wlyemetrp/"
+	links := scrape_links(url, journal)
+	var fullUrl string
+	for _, lnk := range links {
+		fullUrl = url + lnk.Url
+		rec := ProcURL(fullUrl, lnk.Journal)
+		write_out(f, rec)
+	}
+	wg.Done()
+}
+
+func ScrapeRES(f *os.File, wg *sync.WaitGroup) {
+	journal := "RES"
+	url := "http://econpapers.repec.org/article/ouprestud/"
+	links := scrape_links(url, journal)
+	var fullUrl string
+	for _, lnk := range links {
+		fullUrl = url + lnk.Url
+		rec := ProcURL(fullUrl, lnk.Journal)
+		write_out(f, rec)
+	}
+	wg.Done()
+}
+
+func ScrapeAER(f *os.File, wg *sync.WaitGroup) {
+	journal := "AER"
+	url := "http://econpapers.repec.org/article/aeaaecrev/"
+	links := scrape_links(url, journal)
+	var fullUrl string
+	for _, lnk := range links {
+		fullUrl = url + lnk.Url
+		rec := ProcURL(fullUrl, lnk.Journal)
+		write_out(f, rec)
+	}
+	wg.Done()
+}
+
+func ScrapeAll(f *os.File) {
+	fmt.Println("Starting scrapes")
+	var wg sync.WaitGroup
+	// n goroutines to wait for, should be same as n lines before
+	// call to wg.Wait
+	wg.Add(5)
+	go ScrapeQJE(f, &wg)
+	go ScrapeJPE(f, &wg)
+	go ScrapeEMA(f, &wg)
+	go ScrapeRES(f, &wg)
+	go ScrapeAER(f, &wg)
+	wg.Wait()
+}
 
 func main() {
-	ch := make(chan Record)
-	go ScrapeQJE(ch)
-	for rec := range ch {
-		fmt.Println(rec.Journal)
+	out, ferr := os.OpenFile("records.json",
+		os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+	defer out.Close()
+	if ferr != nil {
+		log.Fatal(ferr)
 	}
+	ScrapeAll(out)
 }
